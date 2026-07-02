@@ -18,7 +18,25 @@ st.sidebar.header("Simulation Parameters")
 
 ticker       = st.sidebar.text_input("Ticker", "AAPL").upper()
 lookback     = st.sidebar.selectbox("Historical lookback", ["6mo", "1y", "2y", "5y"], index=2)
-n_sims       = st.sidebar.slider("Number of paths", 100, 20_000, 5_000, step=100)
+n_sims       = st.sidebar.select_slider(
+    "Number of paths (terminal distribution)",
+    options=[100, 1_000, 10_000, 100_000, 500_000, 1_000_000, 2_000_000,
+             5_000_000, 10_000_000, 25_000_000, 50_000_000],
+    value=10_000,
+    format_func=lambda x: f"{x:,}",
+)
+if n_sims >= 5_000_000:
+    st.sidebar.warning(
+        "⚠️ At this scale the app simulates *terminal* prices only "
+        "(closed-form, chunked) — full day-by-day paths aren't stored "
+        "in memory. The fan chart below uses a smaller subsample. "
+        "50M draws may take 10-30s depending on the server."
+    )
+path_display_cap = st.sidebar.slider(
+    "Paths to draw on fan chart", 50, 5_000, 500, step=50,
+    help="Independent of the count above — controls how many full "
+         "day-by-day paths are simulated just for the chart."
+)
 horizon_days = st.sidebar.slider("Horizon (trading days)", 5, 504, 252, step=1)
 use_manual   = st.sidebar.checkbox("Override mu / sigma manually")
 
@@ -44,12 +62,39 @@ def fetch_market_params(ticker: str, lookback: str):
     return s0, mu, sigma, data
 
 
-def simulate_gbm(s0, mu, sigma, n_sims, n_days, dt=1/252, seed=None):
+def simulate_terminal_prices(s0, mu, sigma, n_sims, n_days, dt=1/252,
+                              seed=None, chunk_size=2_000_000, progress_cb=None):
+    """
+    Memory-safe terminal-price sampler using the closed-form GBM solution:
+        S_T = S0 * exp[(mu - 0.5*sigma^2)*T + sigma*sqrt(T)*Z],  Z ~ N(0,1)
+    Draws n_sims samples in chunks so memory stays bounded regardless of
+    how large n_sims is (works fine up to tens of millions of paths).
+    """
     rng = np.random.default_rng(seed if seed != 0 else None)
-    z = rng.standard_normal((n_days, n_sims))
+    T = n_days * dt
+    drift = (mu - 0.5 * sigma**2) * T
+    vol_term = sigma * np.sqrt(T)
+
+    terminal = np.empty(n_sims, dtype=np.float64)
+    done = 0
+    while done < n_sims:
+        n = min(chunk_size, n_sims - done)
+        z = rng.standard_normal(n)
+        terminal[done:done + n] = s0 * np.exp(drift + vol_term * z)
+        done += n
+        if progress_cb is not None:
+            progress_cb(done / n_sims)
+    return terminal
+
+
+def simulate_gbm(s0, mu, sigma, n_paths, n_days, dt=1/252, seed=None):
+    """Full day-by-day path simulation — only used for the fan chart,
+    so n_paths should stay small (hundreds to a few thousand)."""
+    rng = np.random.default_rng(seed if seed != 0 else None)
+    z = rng.standard_normal((n_days, n_paths))
     drift = (mu - 0.5 * sigma**2) * dt
     diffusion = sigma * np.sqrt(dt) * z
-    log_paths = np.vstack([np.zeros(n_sims), np.cumsum(drift + diffusion, axis=0)])
+    log_paths = np.vstack([np.zeros(n_paths), np.cumsum(drift + diffusion, axis=0)])
     return s0 * np.exp(log_paths)
 
 
@@ -70,21 +115,36 @@ if run_button or "paths" not in st.session_state:
     if use_manual:
         mu, sigma = manual_mu, manual_sigma
 
-    paths = simulate_gbm(s0, mu, sigma, n_sims, horizon_days, seed=int(seed_input))
+    seed = int(seed_input)
+
+    # Full day-by-day paths, capped small — for the fan chart only
+    n_chart_paths = min(path_display_cap, n_sims)
+    paths = simulate_gbm(s0, mu, sigma, n_chart_paths, horizon_days, seed=seed)
+
+    # Terminal-only distribution at full requested scale, chunked
+    if n_sims > 1_000_000:
+        progress = st.progress(0.0, text=f"Simulating {n_sims:,} terminal prices…")
+        terminal = simulate_terminal_prices(
+            s0, mu, sigma, n_sims, horizon_days, seed=seed,
+            progress_cb=lambda frac: progress.progress(frac, text=f"Simulating {n_sims:,} terminal prices… {frac:.0%}"),
+        )
+        progress.empty()
+    else:
+        terminal = simulate_terminal_prices(s0, mu, sigma, n_sims, horizon_days, seed=seed)
 
     st.session_state.update(
-        paths=paths, s0=s0, mu=mu, sigma=sigma, hist=hist,
-        data_source=data_source, ticker=ticker,
+        paths=paths, terminal=terminal, s0=s0, mu=mu, sigma=sigma, hist=hist,
+        data_source=data_source, ticker=ticker, n_sims=n_sims,
     )
 
 paths       = st.session_state["paths"]
+terminal    = st.session_state["terminal"]
 s0          = st.session_state["s0"]
 mu          = st.session_state["mu"]
 sigma       = st.session_state["sigma"]
 hist        = st.session_state["hist"]
 data_source = st.session_state["data_source"]
-
-terminal = paths[-1]
+n_sims      = st.session_state["n_sims"]
 
 # ----------------------------- Summary metrics -----------------------------
 st.subheader("Parameters used")
@@ -107,6 +167,11 @@ st.metric("P(terminal price > spot)", f"{(terminal > s0).mean():.2%}")
 
 # ----------------------------- Path fan chart -----------------------------
 st.subheader("Simulated price paths")
+st.caption(
+    f"Terminal statistics below are computed from all {n_sims:,} simulated "
+    f"draws. This chart shows a subsample of {paths.shape[1]:,} full "
+    f"day-by-day paths (controlled separately in the sidebar)."
+)
 
 days = np.arange(paths.shape[0])
 n_show = min(150, paths.shape[1])
@@ -131,7 +196,7 @@ fig1.add_hline(y=s0, line=dict(color="black", dash="dot", width=1),
 fig1.update_layout(
     xaxis_title="Trading days ahead", yaxis_title="Price ($)",
     height=500, template="plotly_white",
-    title=f"{ticker} — {n_sims:,} simulated paths (showing {n_show})",
+    title=f"{ticker} — {paths.shape[1]:,} simulated paths (showing {n_show})",
 )
 st.plotly_chart(fig1, use_container_width=True)
 
