@@ -32,10 +32,12 @@ if n_sims >= 5_000_000:
         "in memory. The fan chart below uses a smaller subsample. "
         "50M draws may take 10-30s depending on the server."
     )
+chart_cap_max = min(n_sims, 5_000)
 path_display_cap = st.sidebar.slider(
-    "Paths to draw on fan chart", 50, 5_000, 500, step=50,
-    help="Independent of the count above — controls how many full "
-         "day-by-day paths are simulated just for the chart."
+    "Paths to draw on fan chart", 1, chart_cap_max, min(500, chart_cap_max), step=1,
+    help="Independent full day-by-day simulation just for the chart. "
+         "Capped at your total sim count above (or 5,000, whichever is smaller) "
+         "since drawing more than that isn't readable anyway."
 )
 horizon_days = st.sidebar.slider("Horizon (trading days)", 5, 504, 252, step=1)
 use_manual   = st.sidebar.checkbox("Override mu / sigma manually")
