@@ -32,13 +32,19 @@ if n_sims >= 5_000_000:
         "in memory. The fan chart below uses a smaller subsample. "
         "50M draws may take 10-30s depending on the server."
     )
-chart_cap_max = min(n_sims, 5_000)
 path_display_cap = st.sidebar.slider(
-    "Paths to draw on fan chart", 1, chart_cap_max, min(500, chart_cap_max), step=1,
-    help="Independent full day-by-day simulation just for the chart. "
-         "Capped at your total sim count above (or 5,000, whichever is smaller) "
-         "since drawing more than that isn't readable anyway."
+    "Paths to draw on fan chart", 1, n_sims, min(500, n_sims), step=1,
+    help="Full day-by-day simulation just for the chart. Matches your "
+         "total sim count above. Note: values over ~5,000 will be "
+         "automatically clamped at render time to avoid crashing the "
+         "browser/server — that many overlapping lines aren't readable anyway."
 )
+RENDER_CAP = 5_000
+if path_display_cap > RENDER_CAP:
+    st.sidebar.warning(
+        f"⚠️ {path_display_cap:,} paths selected — clamping to {RENDER_CAP:,} "
+        f"for the actual chart simulation/render to avoid memory/browser issues."
+    )
 horizon_days = st.sidebar.slider("Horizon (trading days)", 5, 504, 252, step=1)
 use_manual   = st.sidebar.checkbox("Override mu / sigma manually")
 
@@ -119,8 +125,8 @@ if run_button or "paths" not in st.session_state:
 
     seed = int(seed_input)
 
-    # Full day-by-day paths, capped small — for the fan chart only
-    n_chart_paths = min(path_display_cap, n_sims)
+    # Full day-by-day paths, clamped for memory/render safety — for the fan chart only
+    n_chart_paths = min(path_display_cap, n_sims, RENDER_CAP)
     paths = simulate_gbm(s0, mu, sigma, n_chart_paths, horizon_days, seed=seed)
 
     # Terminal-only distribution at full requested scale, chunked
